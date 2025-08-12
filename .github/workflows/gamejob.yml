@@ -1,20 +1,31 @@
 name: Gamejob to Notion (hourly)
 on:
   schedule:
-    - cron: "0 * * * *"   # 매 정시마다 (UTC 기준)
+    - cron: "0 * * * *"    # 매 정시(UTC) = KST 기준 매시 정시
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    concurrency:
+      group: gamejob-notion          # 이전 실행과 겹치지 않게
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
       - run: pip install -r requirements.txt
       - name: Run crawler
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-        run: python gamejob_to_notion.py --list-url "https://www.gamejob.co.kr/Recruit/joblist?menucode=duty&duty=1" --pages 0 --delay 1.5
+        run: |
+          python gamejob_to_notion.py \
+            --list-url "https://www.gamejob.co.kr/Recruit/joblist?menucode=duty&duty=1" \
+            --pages 0 \
+            --delay 1.2 \
+            --detail-mode always \
+            --detail-delay 0.6 \
+            --notion-delay 0.3

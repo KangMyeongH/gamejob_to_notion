@@ -5,7 +5,7 @@
 #   (드라이런, 상세수정일 사용)
 #   python gamejob_to_notion.py --dry-run --pages 1 --limit 10 --detail-mode always --detail-delay 0.5
 #   (전체 업서트)
-#   python gamejob_to_notion.py --pages 0 --delay 1.2 --detail-mode always --detail-delay 0.5
+#   python gamejob_to_notion.py --pages 0 --delay 1.2 --detail-mode always --detail-delay 0.5 --notion-delay 0.3
 
 import os, re, time, json, argparse
 import datetime as dt
@@ -36,7 +36,7 @@ PAGE_PARAM_CANDIDATES = ["Page", "page", "thisPage", "pageIndex"]
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GamejobCrawler/1.5"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GamejobCrawler/1.6"
 })
 
 # ---------------- 유틸 ----------------
@@ -95,7 +95,7 @@ def fetch_list_html(list_url, page):
         return fetch_raw(ajax_url, headers=ajax_headers).text
     except Exception:
         # 일반 쿼리 폴백
-        parsed, qs = urlparse(list_url), parse_qs(urlparse(list_url).query)
+        parsed = urlparse(list_url); qs = parse_qs(urlparse(list_url).query)
         replaced = False
         for key in PAGE_PARAM_CANDIDATES:
             if key in qs:
@@ -197,18 +197,37 @@ def enrich_jobs_with_detail_dates(jobs, referer, mode="always", detail_delay=0.4
         if detail_delay > 0: time.sleep(detail_delay)
     return jobs
 
+# ---------------- Notion 전용 요청 래퍼(재시도/백오프) ----------------
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+@retry(reraise=True, stop=stop_after_attempt(5), wait=wait_exponential(min=1, max=15))
+def notion_request(method: str, url: str, **kwargs) -> requests.Response:
+    """
+    Notion 전용 요청 래퍼: 타임아웃, 재시도(429/5xx 및 네트워크 오류), 백오프.
+    """
+    if "timeout" not in kwargs:
+        kwargs["timeout"] = (10, 30)  # (connect, read)
+    try:
+        r = requests.request(method, url, **kwargs)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        # 네트워크 오류는 재시도 트리거
+        raise e
+    if r.status_code in RETRY_STATUSES:
+        raise requests.HTTPError(f"Retryable status: {r.status_code}", response=r)
+    r.raise_for_status()
+    return r
+
 # ---------------- Notion ----------------
 def get_title_prop_name(db_id):
-    r = requests.get(f"https://api.notion.com/v1/databases/{db_id}", headers=HEADERS_NOTION, timeout=20)
-    r.raise_for_status()
+    r = notion_request("GET", f"https://api.notion.com/v1/databases/{db_id}", headers=HEADERS_NOTION)
     for name, prop in r.json().get("properties", {}).items():
         if prop.get("type") == "title": return name
     raise SystemExit("이 데이터베이스에서 'title' 타입 속성을 찾지 못했습니다.")
 
 def notion_query_by_url(db_id, url):
     query = {"filter": {"property": "URL", "url": {"equals": url}}, "page_size": 1}
-    r = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS_NOTION, json=query, timeout=20)
-    r.raise_for_status()
+    r = notion_request("POST", f"https://api.notion.com/v1/databases/{db_id}/query",
+                       headers=HEADERS_NOTION, json=query)
     data = r.json()
     return data["results"][0] if data.get("results") else None
 
@@ -227,21 +246,29 @@ def to_notion_properties(job):
 
 def notion_create(db_id, job):
     payload = {"parent": {"database_id": db_id}, "properties": to_notion_properties(job)}
-    r = requests.post("https://api.notion.com/v1/pages", headers=HEADERS_NOTION, json=payload, timeout=20)
-    r.raise_for_status(); return r.json()
+    r = notion_request("POST", "https://api.notion.com/v1/pages",
+                       headers=HEADERS_NOTION, json=payload)
+    return r.json()
 
 def notion_update(page_id, job):
     payload = {"properties": to_notion_properties(job)}
-    r = requests.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=HEADERS_NOTION, json=payload, timeout=20)
-    r.raise_for_status(); return r.json()
+    r = notion_request("PATCH", f"https://api.notion.com/v1/pages/{page_id}",
+                       headers=HEADERS_NOTION, json=payload)
+    return r.json()
 
-def upsert_to_notion(db_id, jobs):
+def upsert_to_notion(db_id, jobs, notion_delay: float = 0.2):
     created = updated = 0
     for j in jobs:
         try:
             existing = notion_query_by_url(db_id, j["url"])
-            if existing: notion_update(existing["id"], j); updated += 1
-            else:        notion_create(db_id, j); created += 1
+            if existing:
+                notion_update(existing["id"], j)
+                updated += 1
+            else:
+                notion_create(db_id, j)
+                created += 1
+            if notion_delay > 0:
+                time.sleep(notion_delay)
         except requests.HTTPError as e:
             body = e.response.text if getattr(e, "response", None) else str(e)
             print(f"[Notion Error] {j.get('title','(no title)')}\n{body}")
@@ -296,13 +323,14 @@ def apply_filters(jobs, keyword):
     return out
 
 def main():
-    ap = argparse.ArgumentParser(description="게임잡 -> Notion 업서트 (상세페이지 수정일 사용)")
+    ap = argparse.ArgumentParser(description="게임잡 -> Notion 업서트 (상세페이지 수정일 사용 + Notion 재시도/딜레이)")
     ap.add_argument("--list-url", default=DEFAULT_LIST_URL, help="리스트 URL")
     ap.add_argument("--pages", type=int, default=2, help="가져올 페이지 수 (0 또는 음수=자동 감지)")
     ap.add_argument("--delay", type=float, default=1.0, help="리스트 페이지 요청 간 대기(초)")
     ap.add_argument("--detail-mode", choices=["always","fallback","off"], default="always",
                     help="상세페이지 수정일 사용 모드: always(항상), fallback(리스트에 없을 때만), off(미사용)")
     ap.add_argument("--detail-delay", type=float, default=0.4, help="상세 페이지 요청 간 대기(초)")
+    ap.add_argument("--notion-delay", type=float, default=0.2, help="Notion 업서트 사이 대기(초)")
     ap.add_argument("--keyword", type=str, default=None, help="간이 키워드 필터")
     ap.add_argument("--dry-run", action="store_true", help="Notion 업로드 없이 파일 출력만")
     ap.add_argument("--limit", type=int, default=0, help="최대 N건만 사용(0=제한없음)")
@@ -327,7 +355,7 @@ def main():
 
     global TITLE_PROP_NAME
     TITLE_PROP_NAME = get_title_prop_name(NOTION_DB_ID)
-    created, updated = upsert_to_notion(NOTION_DB_ID, jobs)
+    created, updated = upsert_to_notion(NOTION_DB_ID, jobs, notion_delay=args.notion_delay)
     print(f"✅ Notion 업서트 완료: 생성 {created} / 갱신 {updated}")
 
 if __name__ == "__main__":
