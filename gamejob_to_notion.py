@@ -189,13 +189,16 @@ def extract_jobs(html, base=BASE):
             '충북','충남','전북','전남','경북','경남','제주','해외','재택','시','도','구','군'
         ])), '')
 
-        date_el = tr.select_one('td:nth-of-type(3) .date')
-        mod_el  = tr.select_one('td:nth-of-type(3) .modifyDate')
-        posted_text = " ".join(x for x in [
-            date_el.get_text(strip=True) if date_el else "",
-            mod_el.get_text(strip=True) if mod_el else ""
-        ] if x).strip()
-        posted_iso = parse_posted(posted_text)
+date_el = tr.select_one('td:nth-of-type(3) .date')
+mod_el  = tr.select_one('td:nth-of-type(3) .modifyDate')
+
+# ✅ Posted에는 항상 '수정일'을 우선 사용
+#    (modifyDate가 없을 때만 등록일(date)로 대체)
+posted_text = (
+    mod_el.get_text(strip=True) if mod_el else
+    (date_el.get_text(strip=True) if date_el else "")
+)
+posted_iso = parse_posted(posted_text)
 
         jobs.append({
             "title": title[:2000],
